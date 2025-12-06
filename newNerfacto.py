@@ -284,48 +284,45 @@ class NerfactoModel(Model):
         patch_size: int,
     ) -> torch.Tensor:
         """Render a specific patch region from the NeRF model.
-        
+
         Only generates and renders rays for the patch region,
         avoiding memory overhead of rendering full images.
-        
-        Args:
-            camera_idx: Index of camera to use
-            patch_coords: (top, left) position of patch
-            patch_size: Size of square patch
-            
+
         Returns:
             Rendered patch [patch_size, patch_size, 3], float32, range [0, 1]
         """
         top, left = patch_coords
-        
+
         # Get the camera
         camera = self.train_dataset.cameras[camera_idx].to(self.device)
-        
+
         # Get image dimensions
         height = int(camera.height.item())
         width = int(camera.width.item())
-        
+
         # Clamp patch to image bounds
         top = max(0, min(top, height - patch_size))
         left = max(0, min(left, width - patch_size))
-        
+
         # Generate pixel coordinates for patch
+        # Expect _get_patch_coords to return an [N,2] tensor of (y,x) pixel coords
         coords = self._get_patch_coords(top, left, patch_size, height, width)
-        
+
         # Generate rays for these coordinates
         ray_bundle = camera.generate_rays(
             camera_indices=0,
             coords=coords,
         )
-        
+
         # Render in chunks to manage memory
         chunk_size = 4096
         rgb_outputs = []
-        
+        accumulation_outputs = []
+
         num_rays = ray_bundle.origins.shape[0]
         for i in range(0, num_rays, chunk_size):
             end_idx = min(i + chunk_size, num_rays)
-            
+
             # Create ray bundle for this chunk
             chunk_bundle = RayBundle(
                 origins=ray_bundle.origins[i:end_idx],
@@ -336,39 +333,41 @@ class NerfactoModel(Model):
                 fars=ray_bundle.fars[i:end_idx] if ray_bundle.fars is not None else None,
                 metadata=ray_bundle.metadata,
             )
-            
+
             # Render this chunk
             with torch.no_grad():  # No gradients needed for LPIPS input
                 outputs = self.get_outputs(chunk_bundle)
+                # outputs["rgb"] is [num_chunk_rays, 3], outputs["accumulation"] is [num_chunk_rays, 1]
                 rgb_outputs.append(outputs["rgb"])
                 accumulation_outputs.append(outputs["accumulation"])
-    
+
         # Concatenate and reshape to patch
         rgb_flat = torch.cat(rgb_outputs, dim=0)
         accumulation_flat = torch.cat(accumulation_outputs, dim=0)
-    
+
         rendered_rgb = rgb_flat.view(patch_size, patch_size, 3)
         rendered_accumulation = accumulation_flat.view(patch_size, patch_size, 1)
-    
+
         # Apply background blending (same as training)
         # Create a dummy gt_image (will be ignored in blending)
         dummy_gt = torch.zeros_like(rendered_rgb)
-    
+
         # Use the same blending function
         rendered_rgb_blended, _ = self.renderer_rgb.blend_background_for_loss_computation(
             pred_image=rendered_rgb.view(-1, 3),
             pred_accumulation=rendered_accumulation.view(-1, 1),
             gt_image=dummy_gt.view(-1, 3),
         )
-    
+
         # Reshape back to patch
         rendered_patch = rendered_rgb_blended.view(patch_size, patch_size, 3)
-    
+
         # Ensure float32 and clamp to [0, 1]
         rendered_patch = rendered_patch.float()
         rendered_patch = torch.clamp(rendered_patch, 0.0, 1.0)
-    
+
         return rendered_patch
+
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
@@ -478,7 +477,7 @@ class NerfactoModel(Model):
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
-def get_loss_dict(self, outputs, batch, metrics_dict=None):
+    def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
         image = batch["image"].to(self.device)
         pred_rgb, gt_rgb = self.renderer_rgb.blend_background_for_loss_computation(
@@ -499,34 +498,62 @@ def get_loss_dict(self, outputs, batch, metrics_dict=None):
         if not lpips_enabled or not self.training:
             # Skip LPIPS entirely if disabled or not in training mode
             loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
+
         else:
+            # Use self.step (fall back to 0) instead of any non-existent global_step
+            current_step = getattr(self, "step", 0)
+
             # --- Determine LPIPS frequency ---
             if experiment in ["A", "B"]:
                 should_compute_lpips = True
             else:  # C or D
                 every_n = getattr(self.config, "lpips_every_n_steps", 10)
-                should_compute_lpips = (self.step % every_n == 0)
+                should_compute_lpips = (current_step % every_n == 0)
 
             # --- Determine weight schedule ---
             if experiment == "D":
-                lpips_weight = min(1.0, self.step / 10000) * self.config.lpips_weight
+                lpips_weight = min(1.0, float(current_step) / 10000.0) * float(self.config.lpips_weight)
             else:
-                lpips_weight = self.config.lpips_weight
+                lpips_weight = float(self.config.lpips_weight)
+
+            # --- Ensure pred/gt shapes are proper images for LPIPS ---
+            if pred_rgb.dim() == 2 and ("image" in batch and batch["image"] is not None):
+                img_shape = batch["image"].shape
+
+                if batch["image"].dim() == 3:
+                    H, W, C = img_shape
+                    B = 1
+                elif batch["image"].dim() == 4:
+                    B, H, W, C = img_shape
+                else:
+                    B = 1
+                    H = int((pred_rgb.shape[0] ** 0.5))
+                    W = H
+                    C = 3
+
+                try:
+                    pred_rgb = pred_rgb.view(B, H, W, C)
+                except RuntimeError:
+                    pred_rgb = pred_rgb.contiguous().reshape(B, H, W, C)
+
+                if gt_rgb.dim() == 2:
+                    try:
+                        gt_rgb = gt_rgb.view(B, H, W, C)
+                    except RuntimeError:
+                        gt_rgb = gt_rgb.contiguous().reshape(B, H, W, C)
 
             # --- Compute LPIPS depending on experiment type ---
             if experiment == "A" and should_compute_lpips:
-                # Patch-based LPIPS (baseline)
+
                 if "full_image" in batch and batch["full_image"] is not None:
                     full_target_image = batch["full_image"][0].to(self.device).float()
                     full_target_image = torch.clamp(full_target_image, 0.0, 1.0)
                     camera_idx = batch["camera_indices"][0].item()
 
-                    # Sample patch from full image
                     target_patch, patch_coords = self.datamanager.sample_image_patch(
                         full_target_image, camera_idx, self.config.lpips_patch_size
                     )
 
-                    # Render patch for comparison
                     with torch.cuda.amp.autocast(enabled=False):
                         rendered_patch = self.render_image_patch(
                             camera_idx=camera_idx,
@@ -534,91 +561,51 @@ def get_loss_dict(self, outputs, batch, metrics_dict=None):
                             patch_size=self.config.lpips_patch_size,
                         )
 
-                    # Compute LPIPS on patch
+                    if rendered_patch.dim() == 3:
+                        rendered_patch = rendered_patch.permute(2, 0, 1)[None, ...]
+
+                    if target_patch.dim() == 3:
+                        target_patch = target_patch.permute(2, 0, 1)[None, ...]
+
                     lpips_loss = self.lpips(rendered_patch, target_patch)
                     rgb_loss = self.rgb_loss(pred_rgb, gt_rgb)
 
                     loss_dict["rgb_loss"] = rgb_loss
                     loss_dict["lpips_loss"] = lpips_weight * lpips_loss
+
                 else:
-                    # Fallback if full_image isn't available
                     loss_dict["rgb_loss"] = self.rgb_loss(pred_rgb, gt_rgb)
 
             elif experiment in ["B", "C", "D"] and should_compute_lpips:
-                # Full-image LPIPS - need to render the complete image
-                camera_idx = batch["camera_indices"][0].item()
-                camera = self.datamanager.train_dataset.cameras[camera_idx].to(self.device)
-                
-                # Get full image dimensions
-                H = int(camera.height.item())
-                W = int(camera.width.item())
-                
-                # Generate all rays for the full image
-                with torch.no_grad():
-                    # Create coordinate grid for full image
-                    y_coords, x_coords = torch.meshgrid(
-                        torch.arange(H, device=self.device),
-                        torch.arange(W, device=self.device),
-                        indexing='ij'
-                    )
-                    coords = torch.stack([x_coords, y_coords], dim=-1).reshape(-1, 2)
-                    
-                    # Generate rays for full image
-                    full_ray_bundle = camera.generate_rays(
-                        camera_indices=0,
-                        coords=coords,
-                    )
-                    
-                    # Render in chunks
-                    chunk_size = 4096
-                    rgb_chunks = []
-                    
-                    num_rays = full_ray_bundle.origins.shape[0]
-                    for i in range(0, num_rays, chunk_size):
-                        end_idx = min(i + chunk_size, num_rays)
-                        
-                        chunk_bundle = RayBundle(
-                            origins=full_ray_bundle.origins[i:end_idx],
-                            directions=full_ray_bundle.directions[i:end_idx],
-                            pixel_area=full_ray_bundle.pixel_area[i:end_idx] if full_ray_bundle.pixel_area is not None else None,
-                            camera_indices=full_ray_bundle.camera_indices[i:end_idx] if full_ray_bundle.camera_indices is not None else None,
-                            nears=full_ray_bundle.nears[i:end_idx] if full_ray_bundle.nears is not None else None,
-                            fars=full_ray_bundle.fars[i:end_idx] if full_ray_bundle.fars is not None else None,
-                            metadata=full_ray_bundle.metadata,
-                        )
-                        
-                        chunk_outputs = self.get_outputs(chunk_bundle)
-                        rgb_chunks.append(chunk_outputs["rgb"])
-                    
-                    # Concatenate and reshape to full image
-                    full_pred_rgb = torch.cat(rgb_chunks, dim=0).view(H, W, 3)
-                
-                # Get ground truth full image
-                if "full_image" in batch and batch["full_image"] is not None:
-                    full_gt_rgb = batch["full_image"][0].to(self.device).float()
-                    full_gt_rgb = torch.clamp(full_gt_rgb, 0.0, 1.0)
+
+                if pred_rgb.dim() == 4:
+                    pred_img_nchw = pred_rgb.permute(0, 3, 1, 2)
+                elif pred_rgb.dim() == 3:
+                    pred_img_nchw = pred_rgb.permute(2, 0, 1)[None, ...]
                 else:
-                    # If full image not in batch, load it from dataset
-                    full_gt_rgb = self.datamanager.train_dataset[camera_idx]["image"].to(self.device)
-                    full_gt_rgb = self.renderer_rgb.blend_background(full_gt_rgb)
-                    full_gt_rgb = torch.clamp(full_gt_rgb, 0.0, 1.0)
-                
-                # Convert to [1, 3, H, W] format for LPIPS
-                pred_img = full_pred_rgb.unsqueeze(0).permute(0, 3, 1, 2)
-                gt_img = full_gt_rgb.unsqueeze(0).permute(0, 3, 1, 2)
-                
-                # Downsample for efficiency
-                pred_img_down = F.interpolate(pred_img, scale_factor=0.5, mode='bilinear', align_corners=False)
-                gt_img_down = F.interpolate(gt_img, scale_factor=0.5, mode='bilinear', align_corners=False)
-                
-                # Compute LPIPS
+                    raise RuntimeError(f"Unexpected pred_rgb shape for LPIPS: {pred_rgb.shape}")
+
+                if gt_rgb.dim() == 4:
+                    gt_img_nchw = gt_rgb.permute(0, 3, 1, 2)
+                elif gt_rgb.dim() == 3:
+                    gt_img_nchw = gt_rgb.permute(2, 0, 1)[None, ...]
+                else:
+                    raise RuntimeError(f"Unexpected gt_rgb shape for LPIPS: {gt_rgb.shape}")
+
+                pred_img_down = F.interpolate(
+                    pred_img_nchw, scale_factor=0.5, mode="bilinear", align_corners=False
+                )
+                gt_img_down = F.interpolate(
+                    gt_img_nchw, scale_factor=0.5, mode="bilinear", align_corners=False
+                )
+
                 lpips_loss = self.lpips(pred_img_down, gt_img_down)
                 rgb_loss = self.rgb_loss(pred_rgb, gt_rgb)
 
                 loss_dict["rgb_loss"] = rgb_loss
                 loss_dict["lpips_loss"] = lpips_weight * lpips_loss
+
             else:
-                # Don't compute LPIPS this iteration (for C and D on non-scheduled steps)
                 loss_dict["rgb_loss"] = self.rgb_loss(pred_rgb, gt_rgb)
 
         # --- Standard Nerfacto losses ---
@@ -626,20 +613,26 @@ def get_loss_dict(self, outputs, batch, metrics_dict=None):
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
             )
+
             assert metrics_dict is not None and "distortion" in metrics_dict
-            loss_dict["distortion_loss"] = self.config.distortion_loss_mult * metrics_dict["distortion"]
+            loss_dict["distortion_loss"] = (
+                self.config.distortion_loss_mult * metrics_dict["distortion"]
+            )
 
             if self.config.predict_normals:
                 loss_dict["orientation_loss"] = (
-                    self.config.orientation_loss_mult * torch.mean(outputs["rendered_orientation_loss"])
+                    self.config.orientation_loss_mult *
+                    torch.mean(outputs["rendered_orientation_loss"])
                 )
                 loss_dict["pred_normal_loss"] = (
-                    self.config.pred_normal_loss_mult * torch.mean(outputs["rendered_pred_normal_loss"])
+                    self.config.pred_normal_loss_mult *
+                    torch.mean(outputs["rendered_pred_normal_loss"])
                 )
 
             self.camera_optimizer.get_loss_dict(loss_dict)
 
         return loss_dict
+
 
 
     def get_image_metrics_and_images(
