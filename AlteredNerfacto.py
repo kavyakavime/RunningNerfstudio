@@ -655,4 +655,4 @@ class NerfactoModel(Model):
         #compute variance per image
         lap_var = lap.var(dim=[1, 2, 3], unbiased=False)
 
-        return lap_var(nerfstudio)
+        return lap_var
