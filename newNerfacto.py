@@ -134,15 +134,16 @@ class NerfactoModelConfig(ModelConfig):
     """Config of the camera optimizer to use"""
 
     # Added for LPIPS configuration -- provides hyperparameter data, but doesn't connect it to the pipeline yet
-    # --- LPIPS + Experiment Config ---
+        # --- LPIPS + Experiment Config ---
     use_lpips: bool = True
     lpips_weight: float = 0.1
     lpips_every_n_steps: int = 10
     lpips_patch_size: int = 64
     lpips_weight_schedule: str = "dynamic"  # only used for D
     experiment_id: str = "A"  # one of ["A", "B", "C", "D"]
-    # laplacian config options
+    #laplacian config options
     use_laplacian_loss: float = 0.01
+
 
 
 class NerfactoModel(Model):
@@ -264,7 +265,7 @@ class NerfactoModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
         self.step = 0
-
+        
         # Added LPIPS initialization when flagged
         if self.config.use_lpips:
             self.lpips_loss_fn = HybridRGBLPIPSLoss(
@@ -283,61 +284,49 @@ class NerfactoModel(Model):
         patch_size: int,
     ) -> torch.Tensor:
         """Render a specific patch region from the NeRF model.
-
+        
         Only generates and renders rays for the patch region,
         avoiding memory overhead of rendering full images.
-
+        
         Args:
             camera_idx: Index of camera to use
             patch_coords: (top, left) position of patch
             patch_size: Size of square patch
-
+            
         Returns:
             Rendered patch [patch_size, patch_size, 3], float32, range [0, 1]
         """
         top, left = patch_coords
-
+        
         # Get the camera
         camera = self.train_dataset.cameras[camera_idx].to(self.device)
-
+        
         # Get image dimensions
         height = int(camera.height.item())
         width = int(camera.width.item())
-
+        
         # Clamp patch to image bounds
         top = max(0, min(top, height - patch_size))
         left = max(0, min(left, width - patch_size))
-
-        # Local helper to build coords if self._get_patch_coords is missing
-        def _get_patch_coords(top_, left_, patch_size_, height_, width_):
-            ys = torch.arange(top_, top_ + patch_size_, device=self.device)
-            xs = torch.arange(left_, left_ + patch_size_, device=self.device)
-            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-            coords = torch.stack([grid_y.reshape(-1), grid_x.reshape(-1)], dim=-1)  # [N, 2] as (row, col)
-            return coords
-
-        # Attempt to use existing helper if present, otherwise local
-        if hasattr(self, "_get_patch_coords"):
-            coords = self._get_patch_coords(top, left, patch_size, height, width)
-        else:
-            coords = _get_patch_coords(top, left, patch_size, height, width)
-
+        
+        # Generate pixel coordinates for patch
+        coords = self._get_patch_coords(top, left, patch_size, height, width)
+        
         # Generate rays for these coordinates
-        try:
-            ray_bundle = camera.generate_rays(camera_indices=camera_idx, coords=coords)
-        except Exception:
-            # fallback: try passing tensor camera indices
-            ray_bundle = camera.generate_rays(camera_indices=torch.tensor([camera_idx], device=self.device), coords=coords)
-
+        ray_bundle = camera.generate_rays(
+            camera_indices=0,
+            coords=coords,
+        )
+        
         # Render in chunks to manage memory
         chunk_size = 4096
         rgb_outputs = []
-        accumulation_outputs = []
-
+        
         num_rays = ray_bundle.origins.shape[0]
         for i in range(0, num_rays, chunk_size):
             end_idx = min(i + chunk_size, num_rays)
-
+            
+            # Create ray bundle for this chunk
             chunk_bundle = RayBundle(
                 origins=ray_bundle.origins[i:end_idx],
                 directions=ray_bundle.directions[i:end_idx],
@@ -345,63 +334,40 @@ class NerfactoModel(Model):
                 camera_indices=ray_bundle.camera_indices[i:end_idx] if ray_bundle.camera_indices is not None else None,
                 nears=ray_bundle.nears[i:end_idx] if ray_bundle.nears is not None else None,
                 fars=ray_bundle.fars[i:end_idx] if ray_bundle.fars is not None else None,
-                metadata=None,
+                metadata=ray_bundle.metadata,
             )
-
+            
             # Render this chunk
             with torch.no_grad():  # No gradients needed for LPIPS input
                 outputs = self.get_outputs(chunk_bundle)
-                rgb_outputs.append(outputs["rgb"])  # [N_chunk, 3]
-                accumulation_outputs.append(outputs["accumulation"])  # [N_chunk, 1]
-
+                rgb_outputs.append(outputs["rgb"])
+                accumulation_outputs.append(outputs["accumulation"])
+    
         # Concatenate and reshape to patch
-        rgb_flat = torch.cat(rgb_outputs, dim=0)  # [N_rays, 3]
-        accumulation_flat = torch.cat(accumulation_outputs, dim=0)  # [N_rays, 1]
-
-        # Safety: ensure the number of rays matches expected patch size
-        expected = patch_size * patch_size
-        if rgb_flat.shape[0] != expected:
-            # If mismatch, try to reshape using closest factorization (best-effort)
-            n = rgb_flat.shape[0]
-            h = patch_size
-            w = n // h if (n % h == 0) else int(np.sqrt(n))
-            w = max(1, w)
-            try:
-                rendered_rgb = rgb_flat.reshape(h, w, 3)
-                rendered_accumulation = accumulation_flat.reshape(h, w, 1)
-            except Exception:
-                # Last resort: pad or trim to expected size
-                if rgb_flat.shape[0] > expected:
-                    rgb_flat = rgb_flat[:expected]
-                    accumulation_flat = accumulation_flat[:expected]
-                else:
-                    pad_n = expected - rgb_flat.shape[0]
-                    rgb_flat = torch.cat([rgb_flat, torch.zeros((pad_n, 3), device=rgb_flat.device, dtype=rgb_flat.dtype)], dim=0)
-                    accumulation_flat = torch.cat([accumulation_flat, torch.zeros((pad_n, 1), device=accumulation_flat.device, dtype=accumulation_flat.dtype)], dim=0)
-                rendered_rgb = rgb_flat.reshape(patch_size, patch_size, 3)
-                rendered_accumulation = accumulation_flat.reshape(patch_size, patch_size, 1)
-        else:
-            rendered_rgb = rgb_flat.reshape(patch_size, patch_size, 3)
-            rendered_accumulation = accumulation_flat.reshape(patch_size, patch_size, 1)
-
+        rgb_flat = torch.cat(rgb_outputs, dim=0)
+        accumulation_flat = torch.cat(accumulation_outputs, dim=0)
+    
+        rendered_rgb = rgb_flat.view(patch_size, patch_size, 3)
+        rendered_accumulation = accumulation_flat.view(patch_size, patch_size, 1)
+    
         # Apply background blending (same as training)
+        # Create a dummy gt_image (will be ignored in blending)
         dummy_gt = torch.zeros_like(rendered_rgb)
-
-        # Use the same blending function (expects flattened [N,3] and [N,1])
-        pred_flat = rendered_rgb.reshape(-1, 3)
-        accum_flat = rendered_accumulation.reshape(-1, 1)
-        gt_flat = dummy_gt.reshape(-1, 3)
-
+    
+        # Use the same blending function
         rendered_rgb_blended, _ = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=pred_flat,
-            pred_accumulation=accum_flat,
-            gt_image=gt_flat,
+            pred_image=rendered_rgb.view(-1, 3),
+            pred_accumulation=rendered_accumulation.view(-1, 1),
+            gt_image=dummy_gt.view(-1, 3),
         )
-
-        rendered_patch = rendered_rgb_blended.reshape(rendered_rgb.shape)  # [H, W, 3]
-
-        rendered_patch = rendered_patch.float().clamp(0.0, 1.0)
-
+    
+        # Reshape back to patch
+        rendered_patch = rendered_rgb_blended.view(patch_size, patch_size, 3)
+    
+        # Ensure float32 and clamp to [0, 1]
+        rendered_patch = rendered_patch.float()
+        rendered_patch = torch.clamp(rendered_patch, 0.0, 1.0)
+    
         return rendered_patch
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -529,24 +495,21 @@ class NerfactoModel(Model):
         experiment = getattr(self.config, "experiment_id", "A")  # Default to A
         lpips_enabled = getattr(self.config, "use_lpips", False)
 
-        # Use a safe step counter (trainer may set global_step elsewhere)
-        step = getattr(self, "global_step", getattr(self, "step", 0))
-
         # --- LPIPS Experiment Handling ---
         if not lpips_enabled or not self.training:
             # Skip LPIPS entirely if disabled or not in training mode
-            loss_dict["rgb_loss"] = self.rgb_loss(pred_rgb, gt_rgb)
+            loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
         else:
             # --- Determine LPIPS frequency ---
             if experiment in ["A", "B"]:
                 should_compute_lpips = True
             else:  # C or D
                 every_n = getattr(self.config, "lpips_every_n_steps", 10)
-                should_compute_lpips = (step % every_n == 0)
+                should_compute_lpips = (self.global_step % every_n == 0)
 
             # --- Determine weight schedule ---
             if experiment == "D":
-                lpips_weight = min(1.0, step / 10000) * self.config.lpips_weight
+                lpips_weight = min(1.0, self.global_step / 10000) * self.config.lpips_weight
             else:
                 lpips_weight = self.config.lpips_weight
 
@@ -571,20 +534,10 @@ class NerfactoModel(Model):
                             patch_size=self.config.lpips_patch_size,
                         )
 
-                    # Ensure patches are in [B, C, H, W] for LPIPS (patches come [H, W, C])
-                    if rendered_patch.dim() == 3:
-                        rendered_patch_nchw = rendered_patch.permute(2, 0, 1)[None, ...]
-                    else:
-                        rendered_patch_nchw = rendered_patch
-
-                    if target_patch.dim() == 3:
-                        target_patch_nchw = target_patch.permute(2, 0, 1)[None, ...]
-                    else:
-                        target_patch_nchw = target_patch
-
                     # Compute LPIPS on patch
-                    lpips_loss = self.lpips(rendered_patch_nchw, target_patch_nchw)
+                    lpips_loss = self.lpips(rendered_patch, target_patch)
                     rgb_loss = self.rgb_loss(pred_rgb, gt_rgb)
+                    total_loss = rgb_loss + lpips_weight * lpips_loss
 
                     loss_dict["rgb_loss"] = rgb_loss
                     loss_dict["lpips_loss"] = lpips_weight * lpips_loss
@@ -594,32 +547,11 @@ class NerfactoModel(Model):
 
             elif experiment in ["B", "C", "D"] and should_compute_lpips:
                 # Full-image LPIPS
-                # We must ensure inputs are [B, C, H, W] for interpolate and LPIPS
-                def to_nchw(tensor):
-                    # Accept [H,W,C], [B,H,W,C], [B,C,H,W], [N_rays,3] fallback
-                    if tensor.dim() == 4:
-                        # We expect [B, H, W, C] -> convert to [B, C, H, W]
-                        if tensor.shape[-1] == 3:
-                            return tensor.permute(0, 3, 1, 2)
-                        else:
-                            return tensor
-                    if tensor.dim() == 3:
-                        # [H, W, C] -> [1, C, H, W]
-                        return tensor.permute(2, 0, 1)[None, ...]
-                    if tensor.dim() == 2:
-                        # likely [N_rays, 3] -> fallback: [1, 3, 1, N]
-                        return tensor.permute(1, 0)[None, ..., None]
-                    raise RuntimeError(f"Unexpected tensor dims for LPIPS conversion: {tensor.shape}")
-
-                pred_nchw = to_nchw(pred_rgb)
-                gt_nchw = to_nchw(gt_rgb)
-
-                # Downsample -- keep align_corners False for bilinear stability
-                pred_img_down = F.interpolate(pred_nchw, scale_factor=0.5, mode="bilinear", align_corners=False)
-                gt_img_down = F.interpolate(gt_nchw, scale_factor=0.5, mode="bilinear", align_corners=False)
-
+                pred_img_down = F.interpolate(pred_rgb.permute(0, 3, 1, 2), scale_factor=0.5, mode='bilinear')
+                gt_img_down = F.interpolate(gt_rgb.permute(0, 3, 1, 2), scale_factor=0.5, mode='bilinear')
                 lpips_loss = self.lpips(pred_img_down, gt_img_down)
                 rgb_loss = self.rgb_loss(pred_rgb, gt_rgb)
+                total_loss = rgb_loss + lpips_weight * lpips_loss
 
                 loss_dict["rgb_loss"] = rgb_loss
                 loss_dict["lpips_loss"] = lpips_weight * lpips_loss
@@ -647,6 +579,7 @@ class NerfactoModel(Model):
 
         return loss_dict
 
+
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
@@ -664,35 +597,19 @@ class NerfactoModel(Model):
         combined_depth = torch.cat([depth], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        if gt_rgb.dim() == 3:
-            gt_rgb_nchw = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
-        else:
-            gt_rgb_nchw = gt_rgb
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
 
-        if predicted_rgb.dim() == 3:
-            predicted_rgb_nchw = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
-        else:
-            predicted_rgb_nchw = predicted_rgb
-
-        psnr = self.psnr(gt_rgb_nchw, predicted_rgb_nchw)
-        ssim = self.ssim(gt_rgb_nchw, predicted_rgb_nchw)
-        lpips_val = self.lpips(gt_rgb_nchw, predicted_rgb_nchw)
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
 
         # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}
-        # lpips_val may be tensor or scalar
-        try:
-            metrics_dict["lpips"] = float(lpips_val.item())
-        except Exception:
-            metrics_dict["lpips"] = float(lpips_val)
-
-        # compute blur metric
-        lap_var = self.compute_laplacian_variance(predicted_rgb_nchw)
-        # lap_var is [B]
-        if isinstance(lap_var, torch.Tensor):
-            metrics_dict["laplacian_variance"] = float(lap_var.view(-1)[0].item())
-        else:
-            metrics_dict["laplacian_variance"] = float(lap_var)
+        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
+        metrics_dict["lpips"] = float(lpips)
+        #compute blur metric
+        lap_var = self.compute_laplacian_variance(predicted_rgb)
+        metrics_dict["laplacian_variance"] = float(lap_var.item())
 
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
 
@@ -709,7 +626,7 @@ class NerfactoModel(Model):
     def compute_laplacian_variance(self, img: torch.Tensor) -> torch.Tensor:
         """
         Computes Laplacian variance (focus measure) for a batch of images.
-
+        
         Args:
             img: Tensor of shape [B, C, H, W] with values in [0,1].
                 Only the luminance is used for blur measurement.
@@ -718,33 +635,24 @@ class NerfactoModel(Model):
             lap_var: Tensor of shape [B], variance of Laplacian for each image.
                     Higher values = sharper images.
         """
-        # If input is [H,W,C] or [C,H,W] convert to [B,C,H,W]
-        if img.dim() == 3:
-            # assume [C, H, W] or [H, W, C]
-            if img.shape[0] == 3:
-                img = img.unsqueeze(0)
-            else:
-                img = img.permute(2, 0, 1)[None, ...]
-
         # Convert RGB → grayscale using standard luminance weights
         # Expecting batch tensor: [B, C, H, W]
         if img.shape[1] == 3:
             r, g, b = img[:, 0:1], img[:, 1:2], img[:, 2:3]
             gray = 0.299 * r + 0.587 * g + 0.114 * b
         else:
-            gray = img  # Already grayscale
-
+            gray = img # Already grayscale
         # Laplacian kernel (same as OpenCV Laplacian)
         lap_kernel = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            [[0.,  1., 0.],
+            [1., -4., 1.],
+            [0.,  1., 0.]],
             dtype=gray.dtype,
-            device=gray.device,
-        ).unsqueeze(0).unsqueeze(0)  # shape [1, 1, 3, 3]
-
+            device=gray.device
+        ).unsqueeze(0).unsqueeze(0)   # shape [1, 1, 3, 3]
         # Convolve grayscale image with Laplacian kernel
         lap = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
-
-        # compute variance per image
+        #compute variance per image
         lap_var = lap.var(dim=[1, 2, 3], unbiased=False)
 
         return lap_var
